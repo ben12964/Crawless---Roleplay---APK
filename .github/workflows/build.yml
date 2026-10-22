@@ -1,48 +1,105 @@
 name: Build Crawless Roleplay APK
+
 on:
   workflow_dispatch:
   push:
-    paths:
-      - 'FreeCityRP_v23.apk.part*'
-      - 'crawless_icon.png'
-      - 'customize.py'
-      - '.github/workflows/build.yml'
+    branches:
+      - main
+
 permissions:
   contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-      - uses: android-actions/setup-android@v3
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install image tools
-        run: pip install Pillow
-      - name: Reassemble original APK
-        run: cat FreeCityRP_v23.apk.part* > FreeCityRP_v23.apk
-      - name: Download apktool
-        run: curl -fL https://github.com/iBotPeaches/Apktool/releases/latest/download/apktool.jar -o apktool.jar
-      - name: Decode original APK
-        run: java -jar apktool.jar d -f FreeCityRP_v23.apk -o decoded
-      - name: Apply Crawless branding
-        run: python customize.py
-      - name: Build APK
-        run: java -jar apktool.jar b decoded -o Crawless_Roleplay-unsigned.apk
-      - name: Sign APK (temporary test key)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
         run: |
-          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n1)"
-          "$BT/apksigner" generate-keypair --out test-key.p12 --ks-type PKCS12 --ks-pass pass:temporary123 --key-pass pass:temporary123 --key-alias crawless --key-alg RSA --key-size 2048 --validity 10000 --issuer "CN=Crawless Roleplay"
-          "$BT/apksigner" sign --ks test-key.p12 --ks-type PKCS12 --ks-pass pass:temporary123 --key-pass pass:temporary123 --ks-key-alias crawless --out Crawless_Roleplay-test.apk Crawless_Roleplay-unsigned.apk
-          "$BT/apksigner" verify --verbose Crawless_Roleplay-test.apk
-      - uses: actions/upload-artifact@v4
+          sudo apt-get update
+          sudo apt-get install -y apktool zip unzip python3
+
+      - name: Verify project files
+        run: |
+          set -e
+          for file in \
+            FreeCityRP_v23.apk.part00 \
+            FreeCityRP_v23.apk.part01 \
+            FreeCityRP_v23.apk.part02 \
+            FreeCityRP_v23.apk.part03 \
+            crawless_icon.png \
+            customize.py
+          do
+            if [ ! -f "$file" ]; then
+              echo "Missing required file: $file"
+              exit 1
+            fi
+          done
+
+      - name: Reassemble original APK
+        run: |
+          set -e
+          cat \
+            FreeCityRP_v23.apk.part00 \
+            FreeCityRP_v23.apk.part01 \
+            FreeCityRP_v23.apk.part02 \
+            FreeCityRP_v23.apk.part03 \
+            > FreeCityRP_v23.apk
+
+          unzip -t FreeCityRP_v23.apk
+
+      - name: Decode APK
+        run: |
+          apktool d \
+            -f \
+            FreeCityRP_v23.apk \
+            -o decoded
+
+      - name: Inspect decoded APK
+        run: |
+          echo "Manifest:"
+          grep -n "application" decoded/AndroidManifest.xml || true
+          echo "Launcher resources:"
+          find decoded/res -maxdepth 2 -type f \
+            | grep -E 'mipmap|drawable' \
+            | head -100
+
+      - name: Build APK
+        run: |
+          apktool b decoded -o Crawless_Roleplay_unsigned.apk
+
+      - name: Sign APK
+        run: |
+          set -e
+
+          keytool -genkeypair \
+            -keystore crawless-test.keystore \
+            -storepass temporary123 \
+            -keypass temporary123 \
+            -alias crawless \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 3650 \
+            -dname "CN=Crawless Roleplay"
+
+          apksigner sign \
+            --ks crawless-test.keystore \
+            --ks-key-alias crawless \
+            --ks-pass pass:temporary123 \
+            --key-pass pass:temporary123 \
+            --out Crawless_Roleplay_test.apk \
+            Crawless_Roleplay_unsigned.apk
+
+          apksigner verify --verbose Crawless_Roleplay_test.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
         with:
           name: Crawless-Roleplay-test-APK
-          path: Crawless_Roleplay-test.apk
+          path: Crawless_Roleplay_test.apk
           if-no-files-found: error
-          
+          retention-days: 7
