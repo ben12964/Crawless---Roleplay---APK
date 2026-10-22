@@ -1,0 +1,48 @@
+name: Build Crawless Roleplay APK
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'FreeCityRP_v23.apk.part*'
+      - 'crawless_icon.png'
+      - 'customize.py'
+      - '.github/workflows/build.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install image tools
+        run: pip install Pillow
+      - name: Reassemble original APK
+        run: cat FreeCityRP_v23.apk.part* > FreeCityRP_v23.apk
+      - name: Download apktool
+        run: curl -fL https://github.com/iBotPeaches/Apktool/releases/latest/download/apktool.jar -o apktool.jar
+      - name: Decode original APK
+        run: java -jar apktool.jar d -f FreeCityRP_v23.apk -o decoded
+      - name: Apply Crawless branding
+        run: python customize.py
+      - name: Build APK
+        run: java -jar apktool.jar b decoded -o Crawless_Roleplay-unsigned.apk
+      - name: Sign APK (temporary test key)
+        run: |
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n1)"
+          "$BT/apksigner" generate-keypair --out test-key.p12 --ks-type PKCS12 --ks-pass pass:temporary123 --key-pass pass:temporary123 --key-alias crawless --key-alg RSA --key-size 2048 --validity 10000 --issuer "CN=Crawless Roleplay"
+          "$BT/apksigner" sign --ks test-key.p12 --ks-type PKCS12 --ks-pass pass:temporary123 --key-pass pass:temporary123 --ks-key-alias crawless --out Crawless_Roleplay-test.apk Crawless_Roleplay-unsigned.apk
+          "$BT/apksigner" verify --verbose Crawless_Roleplay-test.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Crawless-Roleplay-test-APK
+          path: Crawless_Roleplay-test.apk
+          if-no-files-found: error
+          
