@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
+    env:
+      ANDROID_HOME: ${{ github.workspace }}/android-sdk
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -24,44 +27,62 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android build tools
+      - name: Install system utilities
         run: |
           set -e
-          sdkmanager "platform-tools" "build-tools;35.0.0"
-          yes | sdkmanager --licenses >/dev/null || true
-
-      - name: Install utilities
-        run: |
           sudo apt-get update
-          sudo apt-get install -y curl jq unzip zip python3
+          sudo apt-get install -y curl unzip zip jq python3
 
-      - name: Download current stable Apktool
+      - name: Install Android SDK without obsolete tools package
         run: |
           set -e
 
-          API="https://api.github.com/repos/iBotPeaches/Apktool/releases/latest"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
 
-          curl -fsSL "$API" -o release.json
+          curl -fL \
+            "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" \
+            -o /tmp/android-tools.zip
 
-          APKTOOL_URL="$(jq -r \
+          mkdir -p /tmp/android-tools
+          unzip -q /tmp/android-tools.zip -d /tmp/android-tools
+
+          mv /tmp/android-tools/cmdline-tools \
+            "$ANDROID_HOME/cmdline-tools/latest"
+
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
+
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
+
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            --sdk_root="$ANDROID_HOME" \
+            "platform-tools" \
+            "build-tools;35.0.0"
+
+      - name: Download Apktool
+        run: |
+          set -e
+
+          curl -fsSL \
+            https://api.github.com/repos/iBotPeaches/Apktool/releases/latest \
+            -o release.json
+
+          URL="$(jq -r \
             '[.assets[] |
               select(.name | test("^apktool_[0-9.]+\\.jar$")) |
               .browser_download_url][0] // empty' release.json)"
 
-          if [ -z "$APKTOOL_URL" ]; then
-            echo "Could not find the Apktool release JAR."
-            cat release.json
+          test -n "$URL" || {
+            echo "Could not locate the Apktool JAR."
             exit 1
-          fi
+          }
 
-          curl -fL "$APKTOOL_URL" -o apktool.jar
-
+          curl -fL "$URL" -o apktool.jar
           java -jar apktool.jar --version
 
-      - name: Verify required project files
+      - name: Verify original APK parts
         run: |
           set -e
 
@@ -71,13 +92,13 @@ jobs:
             FreeCityRP_v23.apk.part02 \
             FreeCityRP_v23.apk.part03
           do
-            if [ ! -s "$file" ]; then
+            test -s "$file" || {
               echo "Missing or empty file: $file"
               exit 1
-            fi
+            }
           done
 
-      - name: Reassemble original APK
+      - name: Reassemble and validate APK
         run: |
           set -e
 
@@ -89,15 +110,14 @@ jobs:
             > FreeCityRP_v23.apk
 
           unzip -t FreeCityRP_v23.apk
-
           sha256sum FreeCityRP_v23.apk
 
-      - name: Decode original APK
+      - name: Decode APK
         run: |
           set -e
+
           java -jar apktool.jar d \
-            -f \
-            FreeCityRP_v23.apk \
+            -f FreeCityRP_v23.apk \
             -o decoded
 
       - name: Repair invalid resource filenames
@@ -106,18 +126,14 @@ jobs:
 
           python3 <<'PY'
           from pathlib import Path
-          import hashlib
           import re
 
           root = Path("decoded/res")
-
-          if not root.exists():
-              raise SystemExit("Decoded resource directory is missing.")
+          if not root.is_dir():
+              raise SystemExit("Decoded resources directory not found.")
 
           mapping = {}
 
-          # Android resource filenames must use lowercase letters,
-          # digits, underscores and periods.
           for path in sorted(root.rglob("*")):
               if not path.is_file():
                   continue
@@ -130,58 +146,44 @@ jobs:
 
               destination = path.with_name(fixed)
 
-              # Prevent overwriting a different resource.
-              if destination.exists() and destination != path:
-                  digest = hashlib.sha256(
-                      str(path).encode()
-                  ).hexdigest()[:8]
-
-                  destination = path.with_name(
-                      f"{path.stem}_{digest}{path.suffix.lower()}"
+              if destination.exists():
+                  raise SystemExit(
+                      f"Resource rename collision: {path} -> {destination}"
                   )
 
-              mapping[name] = destination.name
+              mapping[name] = fixed
               path.rename(destination)
+              print(f"Renamed {path} -> {destination}")
 
-              print(f"Renamed: {name} -> {destination.name}")
+          # Update references in decoded text files.
+          extensions = {
+              ".xml", ".smali", ".txt", ".json", ".html",
+              ".js", ".properties", ".yml", ".yaml"
+          }
 
-          # Update matching names in decoded text files.
-          # Process longer names first to avoid partial replacements.
-          if mapping:
-              text_extensions = {
-                  ".xml", ".smali", ".yml", ".yaml",
-                  ".txt", ".json", ".html", ".js", ".properties"
-              }
+          for path in Path("decoded").rglob("*"):
+              if not path.is_file() or path.suffix.lower() not in extensions:
+                  continue
 
-              for path in Path("decoded").rglob("*"):
-                  if not path.is_file():
-                      continue
+              try:
+                  original = path.read_text(encoding="utf-8")
+              except (UnicodeDecodeError, OSError):
+                  continue
 
-                  if path.suffix.lower() not in text_extensions:
-                      continue
+              updated = original
+              for old, new in sorted(
+                  mapping.items(), key=lambda pair: len(pair[0]), reverse=True
+              ):
+                  updated = updated.replace(old, new)
 
-                  try:
-                      content = path.read_text(encoding="utf-8")
-                  except (UnicodeDecodeError, OSError):
-                      continue
+              if updated != original:
+                  path.write_text(updated, encoding="utf-8")
+                  print(f"Updated references: {path}")
 
-                  updated = content
-
-                  for old, new in sorted(
-                      mapping.items(),
-                      key=lambda item: len(item[0]),
-                      reverse=True
-                  ):
-                      updated = updated.replace(old, new)
-
-                  if updated != content:
-                      path.write_text(updated, encoding="utf-8")
-                      print(f"Updated references in: {path}")
-
-          print(f"Resource filenames repaired: {len(mapping)}")
+          print(f"Renamed {len(mapping)} resource files.")
           PY
 
-      - name: Build unsigned APK
+      - name: Build APK
         run: |
           set -e
 
@@ -195,8 +197,7 @@ jobs:
         run: |
           set -e
 
-          "$ANDROID_HOME/build-tools/35.0.0/zipalign" \
-            -f -v 4 \
+          zipalign -f -v 4 \
             Crawless_Roleplay_unsigned.apk \
             Crawless_Roleplay_aligned.apk
 
@@ -214,11 +215,11 @@ jobs:
             -validity 3650 \
             -dname "CN=Crawless Roleplay"
 
-      - name: Sign APK
+      - name: Sign and verify APK
         run: |
           set -e
 
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
+          apksigner sign \
             --ks crawless-test.keystore \
             --ks-key-alias crawless \
             --ks-pass pass:temporary123 \
@@ -226,14 +227,11 @@ jobs:
             --out Crawless_Roleplay_test.apk \
             Crawless_Roleplay_aligned.apk
 
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify \
-            --verbose \
-            Crawless_Roleplay_test.apk
-
+          apksigner verify --verbose Crawless_Roleplay_test.apk
           unzip -t Crawless_Roleplay_test.apk
           sha256sum Crawless_Roleplay_test.apk
 
-      - name: Upload rebuilt APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: Crawless-Roleplay-test-APK
