@@ -1,75 +1,275 @@
-- name: Repair invalid resource filenames
+name: Build Crawless Roleplay APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ANDROID_HOME: ${{ github.workspace }}/android-sdk
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install utilities
         run: |
           set -e
+          sudo apt-get update
+          sudo apt-get install -y curl unzip zip jq
+          python -m pip install --upgrade pip Pillow
 
-          python3 <<'PY'
+      - name: Install Android SDK without obsolete tools package
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -fL \
+            "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" \
+            -o /tmp/android-tools.zip
+          mkdir -p /tmp/android-tools
+          unzip -q /tmp/android-tools.zip -d /tmp/android-tools
+          mv /tmp/android-tools/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            --sdk_root="$ANDROID_HOME" \
+            "platform-tools" "build-tools;35.0.0"
+
+      - name: Download Apktool
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            https://api.github.com/repos/iBotPeaches/Apktool/releases/latest \
+            -o release.json
+          URL="$(jq -r '[.assets[] | select(.name | test("^apktool_[0-9.]+\\.jar$")) | .browser_download_url][0] // empty' release.json)"
+          if [ -z "$URL" ]; then
+            echo "Could not find the Apktool release JAR."
+            cat release.json
+            exit 1
+          fi
+          curl -fL "$URL" -o apktool.jar
+          java -jar apktool.jar --version
+
+      - name: Verify required files
+        run: |
+          set -euo pipefail
+          for file in \
+            FreeCityRP_v23.apk.part00 \
+            FreeCityRP_v23.apk.part01 \
+            FreeCityRP_v23.apk.part02 \
+            FreeCityRP_v23.apk.part03
+          do
+            if [ ! -s "$file" ]; then
+              echo "Missing or empty required file: $file"
+              exit 1
+            fi
+          done
+          if [ ! -s crawless_icon.png ] && [ ! -s assets/crawless_icon.png ]; then
+            echo "Missing Crawless icon: add crawless_icon.png or assets/crawless_icon.png"
+            exit 1
+          fi
+
+      - name: Reassemble and validate original APK
+        run: |
+          set -euo pipefail
+          cat \
+            FreeCityRP_v23.apk.part00 \
+            FreeCityRP_v23.apk.part01 \
+            FreeCityRP_v23.apk.part02 \
+            FreeCityRP_v23.apk.part03 \
+            > FreeCityRP_v23.apk
+          unzip -t FreeCityRP_v23.apk
+          sha256sum FreeCityRP_v23.apk
+
+      - name: Decode original APK
+        run: |
+          set -euo pipefail
+          java -jar apktool.jar d -f FreeCityRP_v23.apk -o decoded
+
+      - name: Repair invalid resource filenames and references
+        shell: bash
+        run: |
+          set -euo pipefail
+          python <<'PY'
           from pathlib import Path
           import re
 
           root = Path("decoded/res")
           if not root.is_dir():
-              raise SystemExit("ERROR: decoded/res does not exist.")
+              raise SystemExit("ERROR: decoded/res was not created by Apktool.")
 
-          # Map old resource names to new resource names.
+          files = [p for p in root.rglob("*") if p.is_file()]
+          renames = []
           mapping = {}
 
-          for path in sorted(root.rglob("*")):
-              if not path.is_file():
-                  continue
-
+          # Android resource filenames permit lowercase letters, digits,
+          # underscores and dots. Preserve .9.png nine-patch naming.
+          for path in files:
               old_stem = path.stem
               new_stem = re.sub(r"[^a-z0-9_.]", "_", old_stem.lower())
-
-              if old_stem == new_stem:
+              new_name = new_stem + path.suffix.lower()
+              if new_name == path.name:
                   continue
-
-              destination = path.with_name(new_stem + path.suffix.lower())
-
-              if destination.exists():
-                  raise SystemExit(
-                      f"ERROR: Resource collision: {path} -> {destination}"
-                  )
-
+              dest = path.with_name(new_name)
+              renames.append((path, dest, old_stem, new_stem))
               if old_stem in mapping and mapping[old_stem] != new_stem:
-                  raise SystemExit(
-                      f"ERROR: Ambiguous resource name: {old_stem}"
-                  )
-
+                  raise SystemExit(f"Ambiguous resource mapping for {old_stem!r}")
               mapping[old_stem] = new_stem
-              path.rename(destination)
 
-              print(f"Renamed {path} -> {destination}")
+          # Detect collisions before touching any files.
+          source_paths = {src for src, _, _, _ in renames}
+          destinations = [dest for _, dest, _, _ in renames]
+          if len(destinations) != len(set(destinations)):
+              raise SystemExit("Resource repair stopped: two files map to the same filename.")
+          for dest in destinations:
+              if dest.exists() and dest not in source_paths:
+                  raise SystemExit(f"Resource repair stopped: destination already exists: {dest}")
 
-          # Update references to resource names, not just filenames.
-          extensions = {
-              ".xml", ".smali", ".txt", ".json",
-              ".html", ".js", ".properties", ".yaml", ".yml"
+          for src, dest, old_stem, new_stem in renames:
+              src.rename(dest)
+              print(f"Renamed: {src} -> {dest}")
+
+          # Update references by resource stem (not full filename), including
+          # XML @drawable references and values/public.xml declarations.
+          text_extensions = {
+              ".xml", ".smali", ".txt", ".json", ".html", ".js",
+              ".properties", ".yaml", ".yml"
           }
-
           for path in Path("decoded").rglob("*"):
-              if not path.is_file():
+              if not path.is_file() or path.suffix.lower() not in text_extensions:
                   continue
-
-              if path.suffix.lower() not in extensions:
-                  continue
-
               try:
-                  original = path.read_text(encoding="utf-8")
+                  before = path.read_text(encoding="utf-8")
               except (UnicodeDecodeError, OSError):
                   continue
+              after = before
+              for old, new in sorted(mapping.items(), key=lambda item: len(item[0]), reverse=True):
+                  after = after.replace(old, new)
+              if after != before:
+                  path.write_text(after, encoding="utf-8")
+                  print(f"Updated references: {path}")
 
-              updated = original
-
-              for old, new in sorted(
-                  mapping.items(),
-                  key=lambda item: len(item[0]),
-                  reverse=True
-              ):
-                  updated = updated.replace(old, new)
-
-              if updated != original:
-                  path.write_text(updated, encoding="utf-8")
-                  print(f"Updated resource references in {path}")
-
-          print(f"Processed {len(mapping)} resource-name changes.")
+          print(f"Resource filenames repaired: {len(renames)}")
+          print(f"Resource stem mappings applied: {len(mapping)}")
           PY
+
+      - name: Apply Crawless launcher icon and app label
+        run: |
+          set -euo pipefail
+          python <<'PY'
+          from pathlib import Path
+          from PIL import Image
+          import re
+
+          candidates = [Path("crawless_icon.png"), Path("assets/crawless_icon.png")]
+          icon_path = next((p for p in candidates if p.is_file()), None)
+          if icon_path is None:
+              raise SystemExit("Crawless icon file is missing.")
+
+          icon = Image.open(icon_path).convert("RGBA")
+          replaced = 0
+          names = (
+              "ic_launcher.webp", "ic_launcher_round.webp", "ic_launcher_foreground.webp",
+              "ic_launcher.png", "ic_launcher_round.png", "ic_launcher_foreground.png"
+          )
+          for folder in Path("decoded/res").glob("mipmap-*"):
+              if not folder.is_dir():
+                  continue
+              for name in names:
+                  target = folder / name
+                  if not target.is_file():
+                      continue
+                  with Image.open(target) as old:
+                      size = old.size
+                  output = icon.resize(size, Image.Resampling.LANCZOS)
+                  if target.suffix.lower() == ".webp":
+                      output.save(target, "WEBP", quality=92, method=6)
+                  else:
+                      output.save(target, "PNG", optimize=True)
+                  replaced += 1
+                  print(f"Replaced launcher asset: {target}")
+
+          label_updates = 0
+          for strings in Path("decoded/res").glob("values*/strings.xml"):
+              before = strings.read_text(encoding="utf-8")
+              after = re.sub(
+                  r'(<string\s+name="app_name"[^>]*>).*?(</string>)',
+                  r'\1Crawless Roleplay\2', before, count=1, flags=re.S
+              )
+              if after != before:
+                  strings.write_text(after, encoding="utf-8")
+                  label_updates += 1
+
+          if replaced == 0:
+              raise SystemExit("No common launcher icon resources were found; refusing a false-success build.")
+          print(f"Launcher assets replaced: {replaced}; app-label files updated: {label_updates}")
+          PY
+
+      - name: Build unsigned APK
+        run: |
+          set -euo pipefail
+          java -jar apktool.jar b decoded -o Crawless_Roleplay_unsigned.apk
+          unzip -t Crawless_Roleplay_unsigned.apk
+
+      - name: Align APK
+        run: |
+          set -euo pipefail
+          zipalign -f -v 4 Crawless_Roleplay_unsigned.apk Crawless_Roleplay_aligned.apk
+
+      - name: Create temporary test signing key
+        run: |
+          set -euo pipefail
+          keytool -genkeypair \
+            -keystore crawless-test.keystore \
+            -storepass temporary123 \
+            -keypass temporary123 \
+            -alias crawless \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 3650 \
+            -dname "CN=Crawless Roleplay"
+
+      - name: Sign and verify APK
+        run: |
+          set -euo pipefail
+          apksigner sign \
+            --ks crawless-test.keystore \
+            --ks-key-alias crawless \
+            --ks-pass pass:temporary123 \
+            --key-pass pass:temporary123 \
+            --out Crawless_Roleplay_test.apk \
+            Crawless_Roleplay_aligned.apk
+          apksigner verify --verbose Crawless_Roleplay_test.apk
+          unzip -t Crawless_Roleplay_test.apk
+          sha256sum Crawless_Roleplay_test.apk
+
+      - name: Upload test APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Crawless-Roleplay-test-APK
+          path: Crawless_Roleplay_test.apk
+          if-no-files-found: error
+          retention-days: 7
+          
