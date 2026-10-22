@@ -1,126 +1,4 @@
-name: Build Crawless Roleplay APK
-
-on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-
-permissions:
-  contents: read
-
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-
-    env:
-      ANDROID_HOME: ${{ github.workspace }}/android-sdk
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Install system utilities
-        run: |
-          set -e
-          sudo apt-get update
-          sudo apt-get install -y curl unzip zip jq python3
-
-      - name: Install Android SDK without obsolete tools package
-        run: |
-          set -e
-
-          mkdir -p "$ANDROID_HOME/cmdline-tools"
-
-          curl -fL \
-            "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" \
-            -o /tmp/android-tools.zip
-
-          mkdir -p /tmp/android-tools
-          unzip -q /tmp/android-tools.zip -d /tmp/android-tools
-
-          mv /tmp/android-tools/cmdline-tools \
-            "$ANDROID_HOME/cmdline-tools/latest"
-
-          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
-          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
-
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
-
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            --sdk_root="$ANDROID_HOME" \
-            "platform-tools" \
-            "build-tools;35.0.0"
-
-      - name: Download Apktool
-        run: |
-          set -e
-
-          curl -fsSL \
-            https://api.github.com/repos/iBotPeaches/Apktool/releases/latest \
-            -o release.json
-
-          URL="$(jq -r \
-            '[.assets[] |
-              select(.name | test("^apktool_[0-9.]+\\.jar$")) |
-              .browser_download_url][0] // empty' release.json)"
-
-          test -n "$URL" || {
-            echo "Could not locate the Apktool JAR."
-            exit 1
-          }
-
-          curl -fL "$URL" -o apktool.jar
-          java -jar apktool.jar --version
-
-      - name: Verify original APK parts
-        run: |
-          set -e
-
-          for file in \
-            FreeCityRP_v23.apk.part00 \
-            FreeCityRP_v23.apk.part01 \
-            FreeCityRP_v23.apk.part02 \
-            FreeCityRP_v23.apk.part03
-          do
-            test -s "$file" || {
-              echo "Missing or empty file: $file"
-              exit 1
-            }
-          done
-
-      - name: Reassemble and validate APK
-        run: |
-          set -e
-
-          cat \
-            FreeCityRP_v23.apk.part00 \
-            FreeCityRP_v23.apk.part01 \
-            FreeCityRP_v23.apk.part02 \
-            FreeCityRP_v23.apk.part03 \
-            > FreeCityRP_v23.apk
-
-          unzip -t FreeCityRP_v23.apk
-          sha256sum FreeCityRP_v23.apk
-
-      - name: Decode APK
-        run: |
-          set -e
-
-          java -jar apktool.jar d \
-            -f FreeCityRP_v23.apk \
-            -o decoded
-
-      - name: Repair invalid resource filenames
+- name: Repair invalid resource filenames
         run: |
           set -e
 
@@ -130,39 +8,49 @@ jobs:
 
           root = Path("decoded/res")
           if not root.is_dir():
-              raise SystemExit("Decoded resources directory not found.")
+              raise SystemExit("ERROR: decoded/res does not exist.")
 
+          # Map old resource names to new resource names.
           mapping = {}
 
           for path in sorted(root.rglob("*")):
               if not path.is_file():
                   continue
 
-              name = path.name
-              fixed = re.sub(r"[^a-z0-9_.]", "_", name.lower())
+              old_stem = path.stem
+              new_stem = re.sub(r"[^a-z0-9_.]", "_", old_stem.lower())
 
-              if fixed == name:
+              if old_stem == new_stem:
                   continue
 
-              destination = path.with_name(fixed)
+              destination = path.with_name(new_stem + path.suffix.lower())
 
               if destination.exists():
                   raise SystemExit(
-                      f"Resource rename collision: {path} -> {destination}"
+                      f"ERROR: Resource collision: {path} -> {destination}"
                   )
 
-              mapping[name] = fixed
+              if old_stem in mapping and mapping[old_stem] != new_stem:
+                  raise SystemExit(
+                      f"ERROR: Ambiguous resource name: {old_stem}"
+                  )
+
+              mapping[old_stem] = new_stem
               path.rename(destination)
+
               print(f"Renamed {path} -> {destination}")
 
-          # Update references in decoded text files.
+          # Update references to resource names, not just filenames.
           extensions = {
-              ".xml", ".smali", ".txt", ".json", ".html",
-              ".js", ".properties", ".yml", ".yaml"
+              ".xml", ".smali", ".txt", ".json",
+              ".html", ".js", ".properties", ".yaml", ".yml"
           }
 
           for path in Path("decoded").rglob("*"):
-              if not path.is_file() or path.suffix.lower() not in extensions:
+              if not path.is_file():
+                  continue
+
+              if path.suffix.lower() not in extensions:
                   continue
 
               try:
@@ -171,70 +59,17 @@ jobs:
                   continue
 
               updated = original
+
               for old, new in sorted(
-                  mapping.items(), key=lambda pair: len(pair[0]), reverse=True
+                  mapping.items(),
+                  key=lambda item: len(item[0]),
+                  reverse=True
               ):
                   updated = updated.replace(old, new)
 
               if updated != original:
                   path.write_text(updated, encoding="utf-8")
-                  print(f"Updated references: {path}")
+                  print(f"Updated resource references in {path}")
 
-          print(f"Renamed {len(mapping)} resource files.")
+          print(f"Processed {len(mapping)} resource-name changes.")
           PY
-
-      - name: Build APK
-        run: |
-          set -e
-
-          java -jar apktool.jar b \
-            decoded \
-            -o Crawless_Roleplay_unsigned.apk
-
-          unzip -t Crawless_Roleplay_unsigned.apk
-
-      - name: Align APK
-        run: |
-          set -e
-
-          zipalign -f -v 4 \
-            Crawless_Roleplay_unsigned.apk \
-            Crawless_Roleplay_aligned.apk
-
-      - name: Create temporary signing key
-        run: |
-          set -e
-
-          keytool -genkeypair \
-            -keystore crawless-test.keystore \
-            -storepass temporary123 \
-            -keypass temporary123 \
-            -alias crawless \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 3650 \
-            -dname "CN=Crawless Roleplay"
-
-      - name: Sign and verify APK
-        run: |
-          set -e
-
-          apksigner sign \
-            --ks crawless-test.keystore \
-            --ks-key-alias crawless \
-            --ks-pass pass:temporary123 \
-            --key-pass pass:temporary123 \
-            --out Crawless_Roleplay_test.apk \
-            Crawless_Roleplay_aligned.apk
-
-          apksigner verify --verbose Crawless_Roleplay_test.apk
-          unzip -t Crawless_Roleplay_test.apk
-          sha256sum Crawless_Roleplay_test.apk
-
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Crawless-Roleplay-test-APK
-          path: Crawless_Roleplay_test.apk
-          if-no-files-found: error
-          retention-days: 7
